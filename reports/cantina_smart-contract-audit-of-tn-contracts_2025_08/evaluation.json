@@ -1,0 +1,44 @@
+{
+  "agent_execution_id": 1,
+  "project": "cantina_smart-contract-audit-of-tn-contracts_2025_08",
+  "status": "Status.SUCCESS",
+  "result": {
+    "project": "cantina_smart-contract-audit-of-tn-contracts_2025_08",
+    "timestamp": "2026-02-03T20:49:00.419118",
+    "total_expected": 3,
+    "total_found": 0,
+    "true_positives": 0,
+    "false_negatives": 3,
+    "false_positives": 0,
+    "detection_rate": 0.0,
+    "result": "FAIL",
+    "precision": 0.0,
+    "f1_score": 0.0,
+    "matched_findings": [],
+    "missed_findings": [
+      {
+        "id": "cantina_smart-contract-audit-of-tn-contracts_2025_08_expected_000",
+        "title": "Validator can bypass delegator for staking rewards",
+        "description": "TheConsensusRegistrycontract implements delegated staking to allow non-validators to stake on behalf of validators. However, the reward claiming and unstaking functions contain a logical flaw that allows validators to collect rewards and unstaked funds directly, bypassing the delegator who provided the stake. BothclaimStakeRewards()andunstake()functions follow this pattern: This logic sets therecipientto the validator address by default and only checks for delegation if the caller is not the validator. This means that even if a validator has a delegator who provided the stake, the validator can directly call these functions and receive the rewards or unstaked funds for themselves.",
+        "severity": "high",
+        "reason": "No unmatched tool findings remaining"
+      },
+      {
+        "id": "cantina_smart-contract-audit-of-tn-contracts_2025_08_expected_001",
+        "title": "Missing validators in_getValidators()due to token ID gaps",
+        "description": "The_getValidators()function retrieves validator information based on their status. It loops through validator IDs from 1 tototalSupplyto find matching validators: The issue arises when a validator's ConsensusNFT is burned, which decreasestotalSupplybut doesn't affect the ID sequence. For example: This problem affects all functions that rely on_getValidators(), including critical functions that manage the validator lifecycle and committee selection.",
+        "severity": "high",
+        "reason": "No unmatched tool findings remaining"
+      },
+      {
+        "id": "cantina_smart-contract-audit-of-tn-contracts_2025_08_expected_002",
+        "title": "Slashing penalties circumvented due to missing balance reset in_consensusBurn()",
+        "description": "The_consensusBurn()function is called fromapplySlashes()when a validator's balance would be reduced to zero after slashing, and also from theburn()function when a validator is forcefully removed. The function is responsible for ejecting the validator from committees, exiting, retiring, and unstaking them. However, it does not set the validator's balance to zero before unstaking. The issue arises from the condition inapplySlashes()that calls_consensusBurn(): Since_consensusBurn()doesn't set the balance to zero, the unstaking process in_unstake()will use the pre-slash balance (bal) which is inconsistent with the intent of the slashing mechanism:",
+        "severity": "high",
+        "reason": "No unmatched tool findings remaining"
+      }
+    ],
+    "extra_findings": [],
+    "undecided_findings": []
+  }
+}

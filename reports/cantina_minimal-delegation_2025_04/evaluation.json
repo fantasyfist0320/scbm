@@ -1,0 +1,37 @@
+{
+  "agent_execution_id": 1,
+  "project": "cantina_minimal-delegation_2025_04",
+  "status": "Status.SUCCESS",
+  "result": {
+    "project": "cantina_minimal-delegation_2025_04",
+    "timestamp": "2026-02-03T20:49:00.309282",
+    "total_expected": 2,
+    "total_found": 0,
+    "true_positives": 0,
+    "false_negatives": 2,
+    "false_positives": 0,
+    "detection_rate": 0.0,
+    "result": "FAIL",
+    "precision": 0.0,
+    "f1_score": 0.0,
+    "matched_findings": [],
+    "missed_findings": [
+      {
+        "id": "cantina_minimal-delegation_2025_04_expected_000",
+        "title": "execute calls can be front-run",
+        "description": "The function: implemented in theMinimalDelegationcontract is publicly callable, enabling any external address to invoke it if a valid signature is provided. This implementation allows anyone to front-run anyexecutecall as the code simply checks the signature and does not confirm the identity of the caller. Since there is no field for the intended executor address in the signed digest, any party that obtains the signature can submit it first. A very detrimental scenario could be a malicious user supplying no Ether (e.g.,msg.value == 0) in a front-runexecutecall that was supposed to use it, potentially forcing part of the batched calls to revert. IfsignedBatchedCall.shouldRevert = false, the attacker can easily break the intended call flow. Meanwhile, the legitimate user\u2019s subsequent call will revert because the same signature and nonce have already been consumed.",
+        "severity": "high",
+        "reason": "No unmatched tool findings remaining"
+      },
+      {
+        "id": "cantina_minimal-delegation_2025_04_expected_001",
+        "title": "execute calls can be forced to fail with an out of gas error",
+        "description": "In theexecute(SignedBatchedCall memory signedBatchedCall, bytes memory wrappedSignature) public payableflow, a malicious user can specify a gas limit for the overall transaction that is large enough for the \u201chigh-level\u201d portion of theexecutecall to succeed but leaves insufficient gas for the low-level call performed in_dispatch\u2192_execute, where: Due to the EIP-150 \u201c63/64 gas\u201d rule, only 63/64 of the remaining gas is forwarded to a subcall. If the subcall fails for insufficient gas andsignedBatchedCall.shouldRevert == false, the entire batch may partially complete with no revert, thus forcing the intended function call to fail. As a result, the user\u2019s signed batch is sabotaged by the attacker controlling the available gas, while the high-level transaction still succeeds consuming the signature's nonce.",
+        "severity": "high",
+        "reason": "No unmatched tool findings remaining"
+      }
+    ],
+    "extra_findings": [],
+    "undecided_findings": []
+  }
+}

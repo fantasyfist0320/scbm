@@ -1,0 +1,45 @@
+{
+  "agent_execution_id": 1,
+  "project": "code4rena_superposition_2025_01",
+  "status": "Status.SUCCESS",
+  "result": {
+    "project": "code4rena_superposition_2025_01",
+    "timestamp": "2026-02-03T20:49:09.970624",
+    "total_expected": 2,
+    "total_found": 1,
+    "true_positives": 0,
+    "false_negatives": 2,
+    "false_positives": 1,
+    "detection_rate": 0.0,
+    "result": "FAIL",
+    "precision": 0.0,
+    "f1_score": 0.0,
+    "matched_findings": [],
+    "missed_findings": [
+      {
+        "id": "code4rena_superposition_2025_01_expected_000",
+        "title": "Users are incorrectly refunded when liquidity is insufficient",
+        "description": "Submitted by\nZanyBonzy\n, also found by\nQ7\n,\nTigerfrake\n, and\nDadeKuma\n\nIn\nswap_2_internal\n, if the first pool doesn\u2019t have enough liquidity,\namount_in\ncould be less than\noriginal_amount\n, and as expected,\namount_in\nis taken from swapper. But the function still refunds\noriginal_amount - amount_in\nto the user if\noriginal_amount\nis more than\namount_in\n.\n\nFrom the function, we can see than\namount_in\nis taken from swapper. Then the function checks if\noriginal_amount\nis more than\namount_in\n, before which the difference is transferred back to the sender.\n\n>>      erc20::\ntake\n(from, amount_in, permit2)?;\nerc20::\ntransfer_to_sender\n(to, amount_out)?;\n>>\nif\noriginal_amount > amount_in {\nerc20::\ntransfer_to_sender\n(\nto,\noriginal_amount\n>>                  .\nchecked_sub\n(amount_in)\n.\nok_or\n(Error::TransferToSenderSub)?,\n)?;\n}\n\nAn unnecessary refund is processed leading to loss of funds for the protocol. Malicious users can take advantage of this to \u201crob\u201d the protocol of funds through the refunds.\n\nNo need to process refunds since\namount_in\nis already taken.\n\nerc20::take(from, amount_in, permit2)?;\nerc20::transfer_to_sender(to, amount_out)?;\n-       if original_amount > amount_in {\n-           erc20::transfer_to_sender(\n-               to,\n-               original_amount\n-                   .checked_sub(amount_in)\n-                   .ok_or(Error::TransferToSenderSub)?,\n-           )?;\n}\n\nContext\n\naf-afk (Superposition) confirmed\n\n0xsomeone (judge) commented\n:\n\nThe submission and its duplicates have correctly identified that the refund process in the\nswap_2_internal_erc20\nfunction is extraneous and thus results in excess funds being sent to the user.\nI believe a high-risk severity rating is appropriate as the issue manifests itself in all cases and would result in direct fund loss for the AMM pair.\n\naf-afk (Superposition) commented\n:\n\nFor\nIssue #12\n@0xsomeone how does this compare to your findings here?\n\n0xsomeone (judge) commented\n:\n\n@af-afk - I am unsure what comparison is to be drawn here. None of the findings are mine as I am a judge, and I do not believe that the finding referenced has any relation to this one when it comes to impact.\n\naf-afk (Superposition) commented\n:\n\nSorry, I should clarify, I mean your assessment that both are valid. It\u2019s not possible for both of these to be correct, right? I\u2019m of the opinion that this refund should not be implemented after consideration (and this submission) since the contract\u2019s quoting functionality should indicate that this is taking place.\n\n0xsomeone (judge) commented\n:\n\n@af-afk - the original submission shared was submitted in a audit that relies on a different commit hash from this one. As we can observe in the\nhighlighted code segment\n, the code originally transferred the\noriginal_amount\nfrom the\nfrom\naddress.\nIn the remediated code that was part of this audit, the code was updated to\nsimultaneously extract the\namount_in\nfrom the user and perform a refund\n. The incorrect aspect is that two different solutions for the same problem were incorporated, rendering the refund to be extraneous. I hope this clears things up!\n\naf-afk (Superposition) commented\n:\n\nFixed:\nhttps://github.com/fluidity-money/long.so/commit/9c7657e8336208e3397b30c32d557379f88a5b87",
+        "severity": "high",
+        "reason": "Not found"
+      },
+      {
+        "id": "code4rena_superposition_2025_01_expected_001",
+        "title": "No slippage control when withdrawing a position leads to loss of funds",
+        "description": "Submitted by\nDadeKuma\n\nAn attacker can sandwich a user withdrawing funds as there is no way to put slippage protection, which will cause a large loss of funds for the victim.\n\ndecr_position_09293696\nfunction was removed entirely. Now, the only way for users to withdraw funds is by calling\nupdate_position_C_7_F_1_F_740\nwith negative delta.\n\nThe issue is that in this way, users can\u2019t have any slippage protection.\ndecr_position\nallowed users to choose an\namount_0_min\nand\namount_1_min\nof funds to receive, which is now zero.\n\nThis allows an attacker to sandwich their withdrawal to steal a large amount of funds.\n\nConsider reintroducing a withdrawal function that offers slippage protection to users (they should be able to choose\namount_0_min, amount_1_min, amount_0_desired\n, and\namount_1_desired\n).\n\naf-afk (Superposition) acknowledged\n\n0xsomeone (judge) commented\n:\n\nThe submission has demonstrated that liquidity withdrawals from the system are inherently insecure due to being open to arbitrage opportunities as no slippage is enforced.\nI am unsure why the Sponsor has opted to acknowledge this submission as it is a tangible vulnerability and one that merits a high-risk rating. The protocol does not expose a secure way to natively extract funds from it whilst offering this functionality for other types of interactions.\n\naf-afk (Superposition) commented\n:\n\n@0xsomeone - we won\u2019t fix this for now since Superposition has a centralised sequencer, and there\u2019s no MEV that\u2019s possible for a third-party to extract using the base interaction directly with our provider.\n\nDadeKuma (warden) commented\n:\n\n@af-afk - I highly suggest fixing this issue, as a centralized sequencer does not prevent MEV extraction. You can check\nthis impact\non Arbitrum, for example.",
+        "severity": "high",
+        "reason": "Not found"
+      }
+    ],
+    "extra_findings": [
+      {
+        "id": "code4rena_superposition_2025_01_tool_000",
+        "title": "Proxy Admin Can Redirect All Functionality to Malicious Executor, Enabling Complete Fund Drain",
+        "description": "The SeawaterAMM contract uses a proxy pattern where all critical operations (swaps, positions, admin functions) are delegated to externally controlled executor contracts. The proxy_admin has unrestricted power to update any executor address at any time. An attacker who compromises or manipulates the proxy_admin can replace any executor (e.g., swap, swapPermit2, or position executor) with a malicious contract that steals user funds during legitimate operations. Since users interact with the proxy and cannot verify executor code, they trust that the executor is honest \u2014 a trust assumption that is catastrophically broken if the proxy_admin is compromised.",
+        "severity": "critical",
+        "original_id": "37532d4c969811b2"
+      }
+    ],
+    "undecided_findings": []
+  }
+}
