@@ -516,23 +516,29 @@ F. ECONOMIC LOGIC: Same as Solidity — check reward distribution, exchange rate
 # =============================================================================
 
 SYSTEM_VERIFY = """
-You are a smart contract security verification expert. Your job is to verify or reject
-findings against the actual source code. Be STRICT — only confirm findings that are
-demonstrably real.
+You are a smart contract security SKEPTIC. Your job is to DISPROVE findings.
+Play devil's advocate: try to find reasons each finding is WRONG.
 
-For each finding, verify:
+For each finding, attempt to construct a COUNTERARGUMENT:
 
-1. CODE GROUNDING: Does the described function/pattern actually exist in the code?
-2. MECHANISM: Trace the described attack through actual code lines — does it work?
-3. IMPACT: Would exploitation cause real harm (fund loss, DoS, broken invariants)?
+1. CODE GROUNDING: Does the described function/pattern actually exist? Check exact names.
+2. EXISTING PROTECTION: Is there already a guard, modifier, or check that prevents this?
+   - Look for require(), assert(), modifier, SafeMath, nonReentrant that the finding missed.
+   - Look for Solidity 0.8+ automatic overflow protection (unless unchecked block).
+3. MECHANISM TRACE: Trace the attack step by step through actual code. Does EACH step work?
+   - Does the function actually modify the claimed state variable?
+   - Is the claimed call sequence actually possible given access control?
+4. IMPACT REALITY: Even if the mechanism works, is impact real?
+   - Is the affected amount dust (< $1)?
+   - Does the protocol have a recovery mechanism?
+   - Is the attacker cost higher than profit?
 
-CONFIRMED: Bug mechanism checks out, functions exist, impact is real.
-UNCERTAIN: Function exists, mechanism plausible but hard to fully trace.
-REJECTED: Function doesn't exist, mechanism contradicts code, purely informational,
-          Solidity 0.8+ overflow without unchecked, test/mock only, requires malicious admin,
-          centralization risk only, missing events only, gas optimization only.
+If you CANNOT construct a valid counterargument → CONFIRMED (the bug is real).
+If your counterargument is partial → UNCERTAIN (might be real).
+If your counterargument fully disproves the finding → REJECTED.
 
-When in doubt between UNCERTAIN and REJECTED, prefer UNCERTAIN for high/critical severity.
+IMPORTANT: Centralization risks, missing events, gas optimizations, admin trust assumptions,
+and Solidity 0.8+ overflow without unchecked are ALWAYS REJECTED.
 
 Return JSON:
 {{
@@ -540,7 +546,8 @@ Return JSON:
         {{
             "index": 0,
             "verdict": "CONFIRMED",
-            "reasoning": "Brief explanation",
+            "counterargument": "I tried to disprove this by checking for X but found no protection",
+            "reasoning": "Brief explanation of why the bug is real despite my skepticism",
             "adjusted_severity": "critical",
             "adjusted_confidence": 0.85
         }}
@@ -908,6 +915,425 @@ def extract_function_code(content: str, func_name: str, language: str, context_l
             return '\n'.join(f"{n+1:4d}: {l}" for n, l in enumerate(lines[start:end], start))
 
     return ""
+
+
+# =============================================================================
+# SOLUTION #1 & #2: PAIRED-OPERATION STATE DIFF
+# Programmatically finds forward/reverse pairs and diffs their state changes.
+# Turns "reasoning about absence" into "reasoning about presence" for the LLM.
+# =============================================================================
+
+def _extract_function_state_writes(content: str, language: str) -> Dict[str, set]:
+    """Extract which state variables each function modifies. Returns {func_name: {var1, var2, ...}}."""
+    result = {}
+
+    if language == 'solidity':
+        # Collect ALL state variable names (simple types AND mappings/arrays)
+        state_vars = set()
+        # Simple state vars: uint256 public foo;
+        for _, name in re.findall(
+            r'^\s*(?:mapping\s*\([^)]+\)|uint\d*|int\d*|bool|address|bytes\d*|string|address\s+payable)\s+(?:public\s+|private\s+|internal\s+)?(\w+)\s*([;=])',
+            content, re.MULTILINE
+        ):
+            pass
+        for match in re.findall(
+            r'^\s*(?:mapping\s*\([^)]+\)|uint\d*|int\d*|bool|address|bytes\d*|string)\s+(?:public\s+|private\s+|internal\s+)?(\w+)\s*[;=]',
+            content, re.MULTILINE
+        ):
+            state_vars.add(match)
+        # Also catch mapping declarations separately (they're common state vars)
+        for match in re.findall(r'^\s*mapping\s*\([^)]+\)\s+(?:public\s+|private\s+|internal\s+)?(\w+)\s*;', content, re.MULTILINE):
+            state_vars.add(match)
+
+        func_pattern = r'function\s+(\w+)\s*\([^)]*\)[^{]*\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}'
+        for func_name, func_body in re.findall(func_pattern, content, re.DOTALL):
+            writes = set()
+            for var in state_vars:
+                # Direct assignment: var = x, var += x, var -= x
+                if re.search(rf'\b{re.escape(var)}\b\s*[\+\-\*\/]?=(?!=)', func_body):
+                    writes.add(var)
+                # Mapping/array write: var[key] = x, var[key][key2] = x
+                if re.search(rf'\b{re.escape(var)}\b\s*\[', func_body) and re.search(rf'\b{re.escape(var)}\b\s*\[[^\]]*\]\s*[\+\-\*\/]?=(?!=)', func_body):
+                    writes.add(var)
+                # Delete
+                if re.search(rf'delete\s+{re.escape(var)}', func_body):
+                    writes.add(var)
+            if writes:
+                result[func_name] = writes
+
+    elif language == 'rust':
+        field_vars = set(re.findall(r'self\.(\w+)\s*(?:\.|\.get|\.set|\.insert|\.remove|\+=|-=|=)', content))
+        func_pattern = r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)[^{]*\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}'
+        for func_name, func_body in re.findall(func_pattern, content, re.DOTALL):
+            writes = set()
+            for var in field_vars:
+                if re.search(rf'self\.{re.escape(var)}\s*(?:\.|\.set|\.insert|\+=|-=|=(?!=))', func_body):
+                    writes.add(var)
+            if writes:
+                result[func_name] = writes
+
+    return result
+
+
+# Canonical pairs: (forward_keywords, reverse_keywords)
+_PAIRED_OP_PATTERNS = [
+    (['deposit', 'stake', 'lock', 'open', 'queue', 'subscribe', 'enter', 'mint'],
+     ['withdraw', 'unstake', 'unlock', 'close', 'cancel', 'unsubscribe', 'exit', 'burn', 'redeem']),
+    (['borrow', 'lend'],
+     ['repay', 'liquidate']),
+    (['add', 'increase', 'create'],
+     ['remove', 'decrease', 'delete']),
+]
+
+
+def extract_paired_operation_diffs(content: str, language: str) -> str:
+    """Find forward/reverse operation pairs and diff their state modifications.
+
+    Returns a structured text like:
+      PAIRED OPERATION DIFF:
+        deposit() modifies: [totalDeposited, lastRate, balances]
+        withdraw() modifies: [totalDeposited, balances]
+        >>> ASYMMETRY: deposit() modifies [lastRate] which withdraw() does NOT restore
+    """
+    func_writes = _extract_function_state_writes(content, language)
+    if not func_writes:
+        return ""
+
+    func_names = set(func_writes.keys())
+    lines = ["PAIRED OPERATION STATE DIFF:"]
+    found_pairs = set()
+
+    for forward_kws, reverse_kws in _PAIRED_OP_PATTERNS:
+        for fname in func_names:
+            fname_lower = fname.lower()
+            # Check if this function matches a forward keyword
+            matched_forward_kw = None
+            for kw in forward_kws:
+                if kw in fname_lower:
+                    matched_forward_kw = kw
+                    break
+            if not matched_forward_kw:
+                continue
+
+            # Find corresponding reverse function
+            for rname in func_names:
+                rname_lower = rname.lower()
+                for rkw in reverse_kws:
+                    if rkw in rname_lower:
+                        pair_key = tuple(sorted([fname, rname]))
+                        if pair_key in found_pairs:
+                            continue
+                        found_pairs.add(pair_key)
+
+                        fw = func_writes.get(fname, set())
+                        rv = func_writes.get(rname, set())
+
+                        forward_only = fw - rv
+                        reverse_only = rv - fw
+
+                        lines.append(f"  {fname}() modifies: [{', '.join(sorted(fw))}]")
+                        lines.append(f"  {rname}() modifies: [{', '.join(sorted(rv))}]")
+
+                        if forward_only:
+                            lines.append(f"  >>> ASYMMETRY: {fname}() modifies [{', '.join(sorted(forward_only))}] which {rname}() does NOT restore")
+                        if reverse_only:
+                            lines.append(f"  >>> ASYMMETRY: {rname}() modifies [{', '.join(sorted(reverse_only))}] which {fname}() does NOT set")
+                        if not forward_only and not reverse_only:
+                            lines.append(f"  (symmetric — both modify same variables)")
+                        lines.append("")
+
+    return '\n'.join(lines) if len(lines) > 1 else ""
+
+
+# =============================================================================
+# SOLUTION #3: ARITHMETIC PRE-ANALYSIS
+# Extracts all division/multiplication operations, identifies operand types,
+# and flags truncation-to-zero and precision-loss risks.
+# =============================================================================
+
+def extract_arithmetic_annotations(content: str, language: str) -> str:
+    """Analyze division operations for truncation risks.
+
+    Returns structured annotations like:
+      ARITHMETIC ANALYSIS:
+        Line 142: reward * PRECISION / totalSupply
+          - Division may truncate to 0 if totalSupply >> reward * PRECISION
+          - Operands: reward (uint256), PRECISION (constant 1e18), totalSupply (uint256)
+        Line 208: amount / shares * price
+          - DIVISION BEFORE MULTIPLICATION — precision loss
+    """
+    if language not in ('solidity', 'rust'):
+        return ""
+
+    lines_list = content.split('\n')
+    annotations = ["ARITHMETIC RISK ANALYSIS:"]
+
+    # Known precision constants
+    precision_constants = {
+        '1e18', '1e27', '1e6', '1e8', '1e12', '1e36',
+        '1000000000000000000', '1000000', '100000000',
+        'WAD', 'RAY', 'PRECISION', 'SCALE', 'MULTIPLIER', 'BASE',
+        'DECIMAL_FACTOR', 'PRICE_PRECISION', 'RATE_PRECISION',
+    }
+
+    # Skip if using safe math libraries
+    safe_libs = ['SafeMath', 'FixedPoint', 'PRBMath', 'ABDKMath', 'Math.mulDiv', 'FullMath']
+    for lib in safe_libs:
+        if lib in content:
+            annotations.append(f"  Note: Uses {lib} library (some operations may be safe)")
+            break
+
+    # Check for unchecked blocks
+    unchecked_ranges = []
+    depth = 0
+    in_unchecked = False
+    uc_start = 0
+    for i, line in enumerate(lines_list):
+        if 'unchecked' in line and '{' in line:
+            in_unchecked = True
+            uc_start = i
+            depth = 0
+        if in_unchecked:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0:
+                unchecked_ranges.append((uc_start, i))
+                in_unchecked = False
+
+    def is_in_unchecked(line_num: int) -> bool:
+        return any(s <= line_num <= e for s, e in unchecked_ranges)
+
+    found_risks = []
+
+    for i, line in enumerate(lines_list):
+        stripped = line.strip()
+
+        # Skip comments and empty lines
+        if stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*') or not stripped:
+            continue
+
+        # Pattern 1: Division before multiplication — (a / b) * c
+        div_before_mul = re.findall(r'(\w+)\s*/\s*(\w+)\s*\*\s*(\w+)', stripped)
+        for a, b, c in div_before_mul:
+            # Skip if divisor is a precision constant (deliberate scaling)
+            if b in precision_constants or b.upper() in precision_constants:
+                continue
+            found_risks.append(
+                f"  Line {i+1}: {a} / {b} * {c}\n"
+                f"    DIVISION BEFORE MULTIPLICATION — should be ({a} * {c}) / {b} to preserve precision"
+            )
+
+        # Pattern 2: Pro-rated division that can truncate to zero
+        # e.g., reward * factor / totalSupply, amount * elapsed / duration
+        prorated = re.findall(r'(\w+)\s*\*\s*(\w+)\s*/\s*(\w+)', stripped)
+        for a, b, c in prorated:
+            # If divisor looks like a total/supply/duration (large denominator)
+            c_lower = c.lower()
+            large_denom_hints = ['total', 'supply', 'duration', 'period', 'shares', 'balance', 'weight']
+            if any(hint in c_lower for hint in large_denom_hints):
+                found_risks.append(
+                    f"  Line {i+1}: {a} * {b} / {c}\n"
+                    f"    TRUNCATION RISK: If {c} >> {a} * {b}, result truncates to 0\n"
+                    f"    Example: if {a}=100, {b}=1e18, {c}=200_000_000e18, result = 0"
+                )
+
+        # Pattern 3: Standalone division with small numerator risk
+        simple_div = re.findall(r'(\w+)\s*/\s*(\w+)', stripped)
+        for a, b in simple_div:
+            if a == b:
+                continue
+            # Check if this is inside a known safe pattern
+            b_lower = b.lower()
+            a_lower = a.lower()
+            if b_lower in [x.lower() for x in precision_constants]:
+                continue
+            # Flag if numerator looks like per-user amount and denominator looks like total
+            if any(h in a_lower for h in ['reward', 'fee', 'interest', 'accrued', 'earned', 'pending']):
+                if any(h in b_lower for h in ['total', 'supply', 'shares', 'weight']):
+                    found_risks.append(
+                        f"  Line {i+1}: {a} / {b}\n"
+                        f"    ZERO DIVISION RESULT: Small per-user {a} divided by large {b} → 0\n"
+                        f"    Check: Is this inside an accumulator update? If result=0, index never advances"
+                    )
+
+        # Pattern 4: Unchecked arithmetic with value operations
+        if is_in_unchecked(i):
+            if re.search(r'[\+\-\*]', stripped) and not stripped.startswith('//'):
+                has_value_context = any(kw in stripped.lower() for kw in
+                    ['balance', 'amount', 'value', 'total', 'supply', 'shares', 'debt', 'reward'])
+                if has_value_context:
+                    found_risks.append(
+                        f"  Line {i+1}: UNCHECKED arithmetic with value-related variable\n"
+                        f"    Code: {stripped[:100]}\n"
+                        f"    Overflow/underflow possible in Solidity 0.8+ unchecked block"
+                    )
+
+    # Cap at 15 most important
+    for risk in found_risks[:15]:
+        annotations.append(risk)
+
+    return '\n'.join(annotations) if len(annotations) > 1 else ""
+
+
+# =============================================================================
+# SOLUTION #1 (continued): MULTI-STEP SCENARIO GENERATOR
+# Builds concrete 2-3 step attack traces from call graph + state mapping.
+# =============================================================================
+
+def generate_attack_scenarios(content: str, language: str) -> str:
+    """Generate multi-step attack scenario traces from the contract's functions.
+
+    Identifies sequences of calls that could violate invariants:
+    - deposit → transfer → claim (entitlement leak)
+    - stake → earn → unstake without updating rewards
+    - queue → (adverse event) → confirm at stale rate
+    """
+    func_writes = _extract_function_state_writes(content, language)
+    if not func_writes:
+        return ""
+
+    # Classify functions by role
+    value_in = []     # Functions that bring value in
+    value_out = []    # Functions that send value out
+    state_transfer = []  # Functions that transfer state between users
+    rate_changers = []   # Functions that change rates/prices
+
+    for fname, writes in func_writes.items():
+        fl = fname.lower()
+        writes_lower = {w.lower() for w in writes}
+
+        if any(kw in fl for kw in ['deposit', 'stake', 'mint', 'subscribe', 'enter', 'lock', 'borrow']):
+            value_in.append(fname)
+        if any(kw in fl for kw in ['withdraw', 'unstake', 'burn', 'redeem', 'exit', 'unlock', 'claim', 'repay']):
+            value_out.append(fname)
+        if any(kw in fl for kw in ['transfer', 'move', 'assign', 'delegate', 'migrate']):
+            state_transfer.append(fname)
+        if any(kw in wl for kw in ['rate', 'price', 'index', 'factor', 'ratio', 'exchange'] for wl in writes_lower):
+            rate_changers.append(fname)
+
+    scenarios = ["ATTACK SCENARIO TRACES:"]
+
+    # Scenario type 1: deposit → transfer → claim (entitlement leak)
+    for vin in value_in:
+        for xfer in state_transfer:
+            for vout in value_out:
+                vin_writes = func_writes.get(vin, set())
+                xfer_writes = func_writes.get(xfer, set())
+                vout_reads_or_writes = func_writes.get(vout, set())
+
+                # Find state that deposit sets but transfer might not properly scope
+                shared = vin_writes & vout_reads_or_writes
+                if shared and xfer_writes:
+                    scenarios.append(
+                        f"  SCENARIO: {vin}() -> {xfer}() -> {vout}()\n"
+                        f"    {vin}() sets: [{', '.join(sorted(shared))}]\n"
+                        f"    {xfer}() modifies: [{', '.join(sorted(xfer_writes))}]\n"
+                        f"    {vout}() uses: [{', '.join(sorted(shared))}]\n"
+                        f"    QUESTION: After {xfer}(), does the NEW owner inherit accumulated state from {vin}()?\n"
+                        f"    Can attacker: {vin}(100) -> {vout}() -> {xfer}(new_addr) -> {vout}() again?"
+                    )
+
+    # Scenario type 2: rate change between queue and confirm
+    for rc in rate_changers:
+        for vin in value_in:
+            for vout in value_out:
+                rc_writes = func_writes.get(rc, set())
+                vout_writes = func_writes.get(vout, set())
+                # If rate changer modifies variables that withdrawal uses
+                rate_vars = rc_writes & vout_writes
+                if rate_vars:
+                    scenarios.append(
+                        f"  SCENARIO: {vin}() -> [adverse: {rc}()] -> {vout}()\n"
+                        f"    {vin}() locks user into position\n"
+                        f"    {rc}() changes: [{', '.join(sorted(rate_vars))}]\n"
+                        f"    {vout}() reads stale values from when {vin}() was called?\n"
+                        f"    QUESTION: Does {vout}() use the rate from {vin}()-time or current rate?"
+                    )
+
+    # Scenario type 3: value_in → value_out without full state cleanup
+    for vin in value_in:
+        for vout in value_out:
+            vin_w = func_writes.get(vin, set())
+            vout_w = func_writes.get(vout, set())
+            leaked = vin_w - vout_w
+            if leaked:
+                scenarios.append(
+                    f"  SCENARIO: {vin}() -> {vout}() cycle\n"
+                    f"    {vin}() sets but {vout}() doesn't clear: [{', '.join(sorted(leaked))}]\n"
+                    f"    QUESTION: After repeated {vin}() -> {vout}() cycles, do leaked vars accumulate incorrectly?"
+                )
+
+    # Cap scenarios
+    if len(scenarios) > 12:
+        scenarios = scenarios[:12]
+        scenarios.append("  ... (additional scenarios truncated)")
+
+    return '\n'.join(scenarios) if len(scenarios) > 1 else ""
+
+
+# =============================================================================
+# SOLUTION #4: ENHANCED CROSS-CONTRACT RESOLUTION
+# Finds related files via shared type references, external call targets,
+# and interface usage — not just direct imports.
+# =============================================================================
+
+def find_cross_contract_references(content: str, all_files: Dict[str, str], current_file: str) -> List[str]:
+    """Find files related by shared type references, external call targets, and events.
+
+    Goes beyond import-based resolution to catch indirect interactions.
+    """
+    related = set()
+
+    # 1. Extract external call targets: token.transfer(), vault.deposit(), etc.
+    ext_call_targets = set()
+    for match in re.findall(r'(\w+)\s*\.\s*(\w+)\s*\(', content):
+        obj, method = match
+        if obj.lower() not in ('msg', 'block', 'abi', 'tx', 'type', 'super', 'this', 'self'):
+            ext_call_targets.add(method)
+
+    # 2. Extract type references: IERC20(token), IVault(vault), etc.
+    type_refs = set(re.findall(r'([A-Z]\w+)\s*\(', content))
+    type_refs -= {'require', 'assert', 'revert', 'emit', 'Severity', 'Error'}
+
+    # 3. Extract interface names used in state variables
+    interface_vars = set(re.findall(r'(I[A-Z]\w+)\s+(?:public\s+|private\s+|internal\s+)?(\w+)', content))
+    for iface, _ in interface_vars:
+        type_refs.add(iface)
+
+    # 4. Extract event names
+    events = set(re.findall(r'event\s+(\w+)', content))
+
+    # 5. Match against all other files
+    for other_file, other_content in all_files.items():
+        if other_file == current_file:
+            continue
+
+        score = 0
+
+        # Check if other file defines a type/interface that current file uses
+        for tref in type_refs:
+            # Strip leading 'I' for interface matching
+            base_name = tref[1:] if tref.startswith('I') and len(tref) > 1 and tref[1].isupper() else tref
+            if re.search(rf'(?:contract|interface|library)\s+{re.escape(tref)}\b', other_content):
+                score += 3
+            elif re.search(rf'(?:contract|interface|library)\s+{re.escape(base_name)}\b', other_content):
+                score += 2
+
+        # Check if other file implements functions that current file calls externally
+        for method in ext_call_targets:
+            if re.search(rf'function\s+{re.escape(method)}\s*\(', other_content):
+                score += 1
+
+        # Check if other file emits events that current file defines (or vice versa)
+        for event in events:
+            if re.search(rf'emit\s+{re.escape(event)}\s*\(', other_content):
+                score += 1
+
+        if score >= 2:
+            related.add((other_file, score))
+
+    # Return top related files by score
+    sorted_related = sorted(related, key=lambda x: -x[1])
+    return [f for f, _ in sorted_related[:6]]
 
 
 # =============================================================================
@@ -1311,12 +1737,15 @@ class AuditRunner:
     # RELATED CONTENT
     # -----------------------------------------------------------------
 
-    def get_related_content(self, file_path: Path, all_files: List[Path], source_dir: Path) -> str:
+    def get_related_content(self, file_path: Path, all_files: List[Path], source_dir: Path,
+                            file_contents: Dict[str, str] = None) -> str:
         with open(file_path, 'r') as f:
             content = f.read()
 
         language = detect_language(file_path)
+        rel_path = str(file_path.relative_to(source_dir))
 
+        # Method 1: Import/inheritance-based resolution
         if language == 'rust':
             import_pattern = r'(?:use\s+(?:crate|super|self)::(\w+)|mod\s+(\w+))'
             imports = [m[0] or m[1] for m in re.findall(import_pattern, content)]
@@ -1333,24 +1762,37 @@ class AuditRunner:
             for match in re.findall(inherit_pattern, content):
                 inherits.extend([p.strip().split('(')[0].strip() for p in match.split(',')])
 
-        related = []
+        import_related = []
         for term in imports + inherits:
             term_clean = term.replace('./', '').replace('../', '').replace('.sol', '').replace('.rs', '').split('/')[-1]
             for f in all_files:
                 if term_clean in f.stem and f != file_path:
-                    related.append(f)
+                    import_related.append(f)
+
+        # Method 2: Cross-contract reference resolution (Solution #4)
+        cross_ref_files = []
+        if file_contents:
+            cross_refs = find_cross_contract_references(content, file_contents, rel_path)
+            for cr in cross_refs:
+                cr_path = source_dir / cr
+                if cr_path.exists() and cr_path not in import_related:
+                    cross_ref_files.append(cr_path)
+
+        # Merge: import-based first, then cross-ref additions
+        all_related = list(dict.fromkeys(import_related + cross_ref_files))
 
         parts = []
         total_len = 0
-        max_len = 20000
+        max_len = 24000  # Slightly increased to accommodate cross-contract context
 
-        for rf in related[:6]:
+        for rf in all_related[:8]:
             try:
                 with open(rf, 'r') as f:
                     rc = f.read()
                 if total_len + len(rc) < max_len:
                     rf_lang = detect_language(rf)
-                    parts.append(f"\nRELATED FILE: {rf.relative_to(source_dir)}\n```{get_code_block_lang(rf_lang)}\n{rc}\n```")
+                    source_label = "IMPORTED" if rf in import_related else "CROSS-REFERENCED"
+                    parts.append(f"\n{source_label} FILE: {rf.relative_to(source_dir)}\n```{get_code_block_lang(rf_lang)}\n{rc}\n```")
                     total_len += len(rc)
             except:
                 pass
@@ -1384,12 +1826,21 @@ class AuditRunner:
 
         state_mapping = extract_state_mapping(content, language)
         call_graph = extract_call_graph(content, language)
+        paired_diffs = extract_paired_operation_diffs(content, language)
+        arith_annotations = extract_arithmetic_annotations(content, language)
+        attack_scenarios = generate_attack_scenarios(content, language)
 
         context_sections = ""
         if state_mapping:
             context_sections += f"\n{state_mapping}\n"
         if call_graph:
             context_sections += f"\n{call_graph}\n"
+        if paired_diffs:
+            context_sections += f"\n{paired_diffs}\n"
+        if arith_annotations:
+            context_sections += f"\n{arith_annotations}\n"
+        if attack_scenarios:
+            context_sections += f"\n{attack_scenarios}\n"
 
         lang_hint = ""
         if language == 'rust':
@@ -1667,10 +2118,10 @@ Return JSON:
         console.print(f"\n[cyan]Phase 0: Ranking files by audit priority...[/cyan]")
         ranked = self.rank_files(source_dir, files, file_contents)
 
-        # Step 4: Pre-compute related content
+        # Step 4: Pre-compute related content (with enhanced cross-contract resolution)
         related_map = {}
         for f, _tier in ranked:
-            related_map[f] = self.get_related_content(f, files, source_dir)
+            related_map[f] = self.get_related_content(f, files, source_dir, file_contents)
 
         # Step 5: Build prompt assignments based on tier
         solidity_prompts_full = [
