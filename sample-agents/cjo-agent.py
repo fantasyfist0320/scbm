@@ -503,6 +503,7 @@ Return JSON:
 # =============================================================================
 
 KNOWN_FP_PATTERNS = [
+    # Informational / code quality — not security bugs
     r'missing\s+events?\s+emission',
     r'floating\s+pragma',
     r'missing\s+natspec',
@@ -514,6 +515,15 @@ KNOWN_FP_PATTERNS = [
     r'single\s+point\s+of\s+failure',
     r'no\s+event\s+emitted',
     r'missing\s+input\s+validation\s+for\s+zero',
+    # Common LLM hallucination patterns
+    r'unused\s+(variable|function|import)',
+    r'shadowing\s+(state\s+)?variable',
+    r'magic\s+number',
+    r'lack\s+of\s+input\s+sanitization',
+    r'timestamp\s+dependence(?!\s+for\s+price)',  # timestamp-as-randomness, not price staleness
+    r'block\.timestamp\s+manipulation(?!\s+for\s+price)',
+    r'use\s+of\s+tx\.origin',
+    r'lack\s+of\s+two.step\s+ownership',
 ]
 
 SOLIDITY_08_FP_PATTERNS = [
@@ -618,18 +628,81 @@ def is_solidity_08_plus(content: str) -> bool:
         return True
 
 
+def has_reentrancy_guard(content: str, func_name: str) -> bool:
+    """Check if a function has a reentrancy guard modifier."""
+    # Look for the function declaration and check its modifiers
+    pattern = rf'function\s+{re.escape(func_name)}\s*\([^)]*\)\s*((?:(?:external|public|internal|private|view|pure|payable|virtual|override|nonReentrant|noReentrancy|lock|locked|returns\s*\([^)]*\))\s*)*)\{{'
+    match = re.search(pattern, content)
+    if match:
+        modifiers = match.group(1)
+        return any(guard in modifiers for guard in [
+            'nonReentrant', 'noReentrancy', 'lock', 'locked'
+        ])
+    # Also check for ReentrancyGuard inheritance or OpenZeppelin import
+    return False
+
+
+def is_view_or_pure_function(content: str, func_name: str) -> bool:
+    """Check if a function is view or pure (read-only)."""
+    pattern = rf'function\s+{re.escape(func_name)}\s*\([^)]*\)\s*((?:(?:external|public|internal|private|view|pure|payable|virtual|override|nonReentrant|returns\s*\([^)]*\))\s*)*)\{{'
+    match = re.search(pattern, content)
+    if match:
+        modifiers = match.group(1)
+        return 'view' in modifiers or 'pure' in modifiers
+    return False
+
+
+def function_exists_in_code(content: str, func_name: str, language: str) -> bool:
+    """Check if a function name actually exists in the source code."""
+    if language == 'rust':
+        return bool(re.search(rf'\bfn\s+{re.escape(func_name)}\b', content))
+    else:
+        return bool(re.search(rf'\bfunction\s+{re.escape(func_name)}\b', content))
+
+
 def pre_filter_finding(vuln: Vulnerability, content: str) -> Tuple[bool, str]:
     """Return (should_filter, reason) — True means discard this finding."""
     combined = f"{vuln.title.lower()} {vuln.description.lower()}"
 
+    # 1. Known FP text patterns
     for pattern in KNOWN_FP_PATTERNS:
         if re.search(pattern, combined):
             return True, f"Known FP pattern: {pattern[:30]}"
 
+    # 2. Solidity 0.8+ overflow protection
     if is_solidity_08_plus(content):
         for pattern in SOLIDITY_08_FP_PATTERNS:
             if re.search(pattern, combined) and 'unchecked' not in combined:
-                return True, "Solidity 0.8+ has built-in overflow protection"
+                return True, "Solidity 0.8+ overflow protection"
+
+    # 3. Reentrancy reported on a function that has nonReentrant guard
+    if 'reentrancy' in combined or 'reentrant' in combined:
+        # Extract the function name from the finding
+        func_match = re.search(r'\b(\w+)\s*\(\)', vuln.location)
+        if not func_match:
+            func_match = re.search(r'function\s+(\w+)', combined)
+        if func_match:
+            fname = func_match.group(1)
+            if has_reentrancy_guard(content, fname):
+                return True, f"Function {fname} has reentrancy guard"
+
+    # 4. Reentrancy or state-change reported on a view/pure function
+    func_match = re.search(r'\b(\w+)\s*\(\)', vuln.location)
+    if func_match:
+        fname = func_match.group(1)
+        if is_view_or_pure_function(content, fname):
+            if any(kw in combined for kw in ['reentrancy', 'state change', 'drain', 'steal']):
+                return True, f"Function {fname} is view/pure"
+
+    # 5. Finding references a function that doesn't exist in the code
+    referenced_funcs = re.findall(r'\b(\w{3,})\s*\(', vuln.title)
+    if referenced_funcs:
+        lang = 'rust' if '.rs' in vuln.file else 'solidity'
+        primary_func = referenced_funcs[0]
+        # Only filter if the primary function in the title doesn't exist
+        if primary_func not in ('function', 'require', 'revert', 'emit', 'assert'):
+            if not function_exists_in_code(content, primary_func, lang):
+                return True, f"Function {primary_func}() not found in code"
 
     return False, ""
 
@@ -770,6 +843,58 @@ def deduplicate_findings(vulnerabilities: List[Vulnerability]) -> List[Vulnerabi
             deduped.append(vuln)
 
     return deduped
+
+
+def cross_prompt_boost(vulnerabilities: List[Vulnerability]) -> List[Vulnerability]:
+    """Boost confidence of findings that were independently found by multiple prompts.
+    If 2+ different prompts report the same root-cause bug, it's more likely real."""
+    if not vulnerabilities:
+        return vulnerabilities
+
+    # Group by file
+    by_file: Dict[str, List[Vulnerability]] = {}
+    for v in vulnerabilities:
+        by_file.setdefault(v.file, []).append(v)
+
+    stopwords = {'function', 'if', 'for', 'while', 'require', 'revert',
+                 'emit', 'return', 'memory', 'storage', 'uint256', 'address'}
+
+    for file_path, file_vulns in by_file.items():
+        for i, v1 in enumerate(file_vulns):
+            # Extract which prompt generated this finding
+            prompt1 = v1.reported_by_model.split('_', 1)[-1] if '_' in v1.reported_by_model else ''
+            # Extract function names mentioned
+            funcs1 = set(re.findall(r'(\w+)\s*\(', f"{v1.title} {v1.description[:300]}")) - stopwords
+
+            corroborating_prompts = set()
+            for j, v2 in enumerate(file_vulns):
+                if i == j:
+                    continue
+                prompt2 = v2.reported_by_model.split('_', 1)[-1] if '_' in v2.reported_by_model else ''
+                if prompt1 == prompt2:
+                    continue  # Same prompt, not independent confirmation
+
+                funcs2 = set(re.findall(r'(\w+)\s*\(', f"{v2.title} {v2.description[:300]}")) - stopwords
+
+                # Check if they reference the same functions (same root cause)
+                common_funcs = funcs1 & funcs2
+                if len(common_funcs) >= 1:
+                    # Check title similarity too
+                    words1 = set(re.findall(r'\w{4,}', v1.title.lower()))
+                    words2 = set(re.findall(r'\w{4,}', v2.title.lower()))
+                    if words1 and words2:
+                        title_overlap = len(words1 & words2) / max(len(words1 | words2), 1)
+                        if title_overlap > 0.3 or len(common_funcs) >= 2:
+                            corroborating_prompts.add(prompt2)
+
+            # Boost confidence based on number of independent confirmations
+            if len(corroborating_prompts) >= 2:
+                v1.confidence = min(v1.confidence + 0.15, 1.0)
+                console.print(f"[dim]    Boosted (3+ prompts): {v1.title[:50]}[/dim]")
+            elif len(corroborating_prompts) >= 1:
+                v1.confidence = min(v1.confidence + 0.08, 1.0)
+
+    return vulnerabilities
 
 
 def compute_specificity_score(finding: Vulnerability, file_content: str = "") -> float:
@@ -1339,22 +1464,52 @@ Return JSON:
         console.print(f"[cyan]Phase 1 found {len(all_vulns)} raw findings[/cyan]")
 
         # =============================================
+        # CROSS-PROMPT BOOSTING
+        # Findings confirmed by multiple prompts get
+        # confidence boosted before dedup/verification.
+        # =============================================
+        console.print(f"\n[cyan]Cross-prompt boosting...[/cyan]")
+        all_vulns = cross_prompt_boost(all_vulns)
+
+        # =============================================
         # DEDUPLICATION
         # =============================================
         deduped = deduplicate_findings(all_vulns)
         console.print(f"[dim]After dedup: {len(deduped)} unique findings[/dim]")
 
         # =============================================
-        # PHASE 2: VERIFICATION
+        # PHASE 2: LLM VERIFICATION
+        # Send findings back to the LLM with the code
+        # to confirm/reject each one.
         # =============================================
         verified = self.verify_findings(source_dir, deduped, file_contents, verify_model)
         console.print(f"[cyan]After verification: {len(verified)} findings[/cyan]")
 
         # =============================================
+        # PHASE 3: STATIC VALIDATION
+        # Additional code-grounded checks that don't
+        # need an LLM call.
+        # =============================================
+        console.print(f"\n[cyan]Phase 3: Static validation...[/cyan]")
+        static_validated = []
+        for v in verified:
+            content = file_contents.get(v.file, "")
+            if not content:
+                static_validated.append(v)
+                continue
+
+            should_filter, reason = pre_filter_finding(v, content)
+            if should_filter:
+                console.print(f"[dim]  Static reject: {v.title[:50]} ({reason})[/dim]")
+                continue
+            static_validated.append(v)
+        console.print(f"[dim]After static validation: {len(static_validated)} findings[/dim]")
+
+        # =============================================
         # QUALITY GATE: specificity scoring + sort
         # =============================================
         scored = []
-        for v in verified:
+        for v in static_validated:
             content = file_contents.get(v.file, "")
             spec_score = compute_specificity_score(v, content)
             scored.append((spec_score, v))
